@@ -15,7 +15,6 @@ import { MonaiLabelService, MonaiLabelError, MonaiModel, MonaiServerInfo } from 
 import {
   SegmentationApiService,
   SegmentationSummary,
-  SegmentationLabel,
 } from '../services/SegmentationApiService';
 import { getLabelColor } from '../utils/GenericUtils';
 import { useMonaiOnDemand } from '../hooks/useMonaiOnDemand';
@@ -113,13 +112,18 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
 
   // State for segmentation persistence
   const [savedSegmentations, setSavedSegmentations] = useState<SegmentationSummary[]>([]);
-  const [isSaving, setIsSaving] = useState(false);
   const [isLoadingList, setIsLoadingList] = useState(false);
   const [isLoadingMask, setIsLoadingMask] = useState(false);
-  const [lastNrrdData, setLastNrrdData] = useState<ArrayBuffer | null>(null);
   const [persistenceEnabled, setPersistenceEnabled] = useState(false);
   const [currentSeriesUid, setCurrentSeriesUid] = useState<string | null>(null);
   const fetchedSeriesRef = useRef<string | null>(null); // Track fetched series to avoid duplicates
+
+  // Active async segmentation job (populated after POST /segmentations).
+  // In the async pipeline the browser never holds the NRRD — when the
+  // worker Lambda finishes, we fetch the mask via presigned URL.
+  const [activeJob, setActiveJob] = useState<
+    { segmentationId: string; status: 'PENDING' | 'ACTIVE' | 'FAILED' } | null
+  >(null);
 
   // Get MONAI Label service from services manager
   const monaiService = servicesManager.services.monaiLabelService as MonaiLabelService | undefined;
@@ -304,6 +308,112 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
       setIsLoadingList(false);
     }
   }, [segmentationApiService, getActiveViewportInfo]);
+
+  // React to async segmentation completion — WebSocket first, polling fallback.
+  useEffect(() => {
+    if (!segmentationApiService) return;
+    if (!activeJob || activeJob.status !== 'PENDING') return;
+
+    const { uiNotificationService } = servicesManager.services;
+    const segmentationId = activeJob.segmentationId;
+    let finished = false;
+
+    const handleComplete = async (status: 'ACTIVE' | 'FAILED', errMessage?: string) => {
+      if (finished) return;
+      finished = true;
+
+      if (status === 'FAILED') {
+        setActiveJob({ segmentationId, status: 'FAILED' });
+        setError(errMessage || 'Segmentation failed');
+        setIsRunning(false);
+        if (uiNotificationService) {
+          uiNotificationService.show({
+            title: 'Segmentazione fallita',
+            message: errMessage || 'Il worker non ha completato la segmentazione.',
+            type: 'error',
+            duration: 6000,
+          });
+        }
+        return;
+      }
+
+      try {
+        const seg = await segmentationApiService.getSegmentation(segmentationId);
+        await paintSegmentationFromApi(seg);
+        setActiveJob({ segmentationId, status: 'ACTIVE' });
+        if (uiNotificationService) {
+          uiNotificationService.show({
+            title: 'Segmentation Complete',
+            message: `${seg.labels.length} segments ready`,
+            type: 'success',
+            duration: 3000,
+          });
+        }
+        await fetchSavedSegmentations();
+      } catch (err) {
+        console.error('MONAI Label: Failed to fetch completed segmentation', err);
+        setError(err instanceof Error ? err.message : 'Failed to load mask');
+        setActiveJob({ segmentationId, status: 'FAILED' });
+      } finally {
+        setIsRunning(false);
+        // Clear the in-flight marker after a short delay so the "Complete"
+        // block is briefly visible to the user.
+        setTimeout(() => {
+          setActiveJob((prev) =>
+            prev && prev.segmentationId === segmentationId ? null : prev
+          );
+        }, 2_000);
+      }
+    };
+
+    const wsHandler = (event: Event) => {
+      const custom = event as CustomEvent<{
+        type?: string;
+        payload?: {
+          segmentationId?: string;
+          status?: 'ACTIVE' | 'FAILED';
+          errorMessage?: string;
+        };
+      }>;
+      const msg = custom.detail;
+      if (!msg) return;
+      if (msg.type !== 'SEGMENTATION_READY' && msg.type !== 'SEGMENTATION_FAILED') {
+        return;
+      }
+      if (msg.payload?.segmentationId !== segmentationId) return;
+      const nextStatus =
+        msg.type === 'SEGMENTATION_FAILED' || msg.payload?.status === 'FAILED'
+          ? 'FAILED'
+          : 'ACTIVE';
+      handleComplete(nextStatus, msg.payload?.errorMessage);
+    };
+
+    window.addEventListener('medivault:ws:message', wsHandler);
+
+    // Polling fallback — handles the case where the WebSocket is not
+    // available or the push event is missed.
+    const pollInterval = window.setInterval(async () => {
+      if (finished) return;
+      try {
+        const seg = await segmentationApiService.getSegmentation(segmentationId);
+        if (seg.status === 'ACTIVE') handleComplete('ACTIVE');
+        else if (seg.status === 'FAILED') handleComplete('FAILED', seg.errorMessage);
+      } catch (err) {
+        console.warn('MONAI Label: polling error', err);
+      }
+    }, 3_000);
+
+    const pollTimeout = window.setTimeout(() => {
+      if (finished) return;
+      handleComplete('FAILED', 'Segmentation timed out');
+    }, 300_000); // 5 min
+
+    return () => {
+      window.removeEventListener('medivault:ws:message', wsHandler);
+      window.clearInterval(pollInterval);
+      window.clearTimeout(pollTimeout);
+    };
+  }, [activeJob, segmentationApiService, paintSegmentationFromApi, servicesManager, fetchSavedSegmentations]);
 
   // Fetch saved segmentations when viewport is ready or series changes
   useEffect(() => {
@@ -619,18 +729,68 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
     throw new Error('Failed to create labelmap for segmentation');
   };
 
-  // Run segmentation
+  // Paint a fetched segmentation (from presigned URL) onto the viewport
+  // using the same viewResponse path that load-from-saved already uses.
+  const paintSegmentationFromApi = useCallback(
+    async (segmentation: SegmentationSummary) => {
+      if (!segmentationApiService) return;
+
+      const maskData = await segmentationApiService.downloadMask(
+        segmentation.segmentationId
+      );
+
+      const inferenceResponse: InferenceResponse = {
+        label: maskData,
+        label_names: segmentation.labels.reduce(
+          (acc, l) => {
+            acc[l.name] = l.id;
+            return acc;
+          },
+          {} as Record<string, number>
+        ),
+      };
+
+      const labels = segmentation.labels.map((l) => l.name);
+
+      if (!labelMaps?.modelLabelToIdxMap[segmentation.modelName]) {
+        const newLabelMaps = { ...labelMaps } as ModelLabelMaps;
+        newLabelMaps.modelLabelToIdxMap[segmentation.modelName] = {};
+        newLabelMaps.modelIdxToLabelMap[segmentation.modelName] = {};
+        newLabelMaps.modelLabelNames[segmentation.modelName] = [];
+        newLabelMaps.modelLabelIndices[segmentation.modelName] = [];
+
+        segmentation.labels.forEach((l) => {
+          newLabelMaps.modelLabelToIdxMap[segmentation.modelName][l.name] = l.id;
+          newLabelMaps.modelIdxToLabelMap[segmentation.modelName][l.id] = l.name;
+          newLabelMaps.modelLabelNames[segmentation.modelName].push(l.name);
+          newLabelMaps.modelLabelIndices[segmentation.modelName].push(l.id);
+        });
+
+        setLabelMaps(newLabelMaps);
+      }
+
+      await viewResponse(inferenceResponse, segmentation.modelName, labels, true);
+      setLastResult({
+        segmentationId: SEGMENTATION_ID,
+        segments: labels.length,
+      });
+    },
+    // viewResponse has stable references captured via servicesManager
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [segmentationApiService, labelMaps]
+  );
+
+  // Enqueue an async segmentation job. The worker Lambda runs MONAI,
+  // uploads the mask to S3, and emits a SEGMENTATION_READY WebSocket
+  // event (which we consume below).
   const handleRunSegmentation = async () => {
-    if (!monaiService || !selectedModel) {
+    if (!segmentationApiService || !selectedModel) {
       return;
     }
 
-    // Check if MONAI is ready (on-demand mode)
     if (onDemandEnabled && !isMonaiReady) {
-      console.log('MONAI Label: MONAI not ready, triggering ensureRunning...');
       const started = await ensureMonaiRunning();
       if (!started) {
-        // MONAI is starting - user will need to wait and try again
         const { uiNotificationService } = servicesManager.services;
         if (uiNotificationService) {
           uiNotificationService.show({
@@ -649,69 +809,30 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
     setLastResult(null);
 
     try {
-      const { uiNotificationService } = servicesManager.services;
       const viewportInfo = getActiveViewportInfo();
-
-      if (!viewportInfo?.displaySet?.StudyInstanceUID) {
+      if (
+        !viewportInfo?.displaySet?.StudyInstanceUID ||
+        !viewportInfo?.displaySet?.SeriesInstanceUID
+      ) {
         throw new Error('No image loaded in active viewport');
       }
 
-      const studyInstanceUID = viewportInfo.displaySet.StudyInstanceUID;
+      const studyInstanceUid = viewportInfo.displaySet.StudyInstanceUID;
+      const seriesInstanceUid = viewportInfo.displaySet.SeriesInstanceUID;
 
-      console.log('MONAI Label: Starting inference with model:', selectedModel);
-      console.log('MONAI Label: Study UID:', studyInstanceUID);
-
-      // Run inference
-      const result = await monaiService.runInference(selectedModel, studyInstanceUID);
-
-      console.log(
-        'MONAI Label: Inference completed, label data size:',
-        result.label?.byteLength || 0
-      );
-
-      // Store the NRRD data for potential save operation
-      setLastNrrdData(result.label);
-
-      // Get labels for this model
-      const modelLabels = labelMaps?.modelLabelNames[selectedModel] || [];
-
-      // Update segmentation with result
-      await viewResponse(result, selectedModel, modelLabels, true);
-
-      setLastResult({
-        segmentationId: SEGMENTATION_ID,
-        segments: modelLabels.length,
+      const { segmentationId, status } = await segmentationApiService.startSegmentation({
+        seriesInstanceUid,
+        studyInstanceUid,
+        modelName: selectedModel,
+        force: true,
       });
 
-      if (uiNotificationService) {
-        uiNotificationService.show({
-          title: 'Segmentation Complete',
-          message: `Created ${modelLabels.length} segments`,
-          type: 'success',
-          duration: 3000,
-        });
-      }
+      console.log('MONAI Label: Job enqueued', { segmentationId, status });
+      setActiveJob({ segmentationId, status });
+      // Spinner stays on until the WebSocket / polling observer closes the job.
     } catch (err) {
-      console.error('MONAI Label: Segmentation error', err);
-
-      // Use user-friendly message from MonaiLabelError
-      if (err instanceof MonaiLabelError) {
-        setError(err.message);
-
-        // Show notification for quota errors
-        const { uiNotificationService } = servicesManager.services;
-        if (err.statusCode === 429 && uiNotificationService) {
-          uiNotificationService.show({
-            title: 'Crediti esauriti',
-            message: err.message,
-            type: 'error',
-            duration: 5000,
-          });
-        }
-      } else {
-        setError(err instanceof Error ? err.message : 'Segmentation failed');
-      }
-    } finally {
+      console.error('MONAI Label: Failed to enqueue segmentation', err);
+      setError(err instanceof Error ? err.message : 'Segmentation failed');
       setIsRunning(false);
     }
   };
@@ -781,76 +902,6 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
     }
   };
 
-  // Save current segmentation to backend
-  const handleSaveSegmentation = async () => {
-    if (!segmentationApiService || !lastNrrdData || !selectedModel) {
-      setError('No segmentation to save');
-      return;
-    }
-
-    const viewportInfo = getActiveViewportInfo();
-    if (!viewportInfo?.displaySet) {
-      setError('No image loaded');
-      return;
-    }
-
-    const { displaySet } = viewportInfo;
-    const seriesInstanceUid = displaySet.SeriesInstanceUID;
-    const studyInstanceUid = displaySet.StudyInstanceUID;
-
-    if (!seriesInstanceUid || !studyInstanceUid) {
-      setError('Missing series or study UID');
-      return;
-    }
-
-    setIsSaving(true);
-    setError(null);
-
-    try {
-      const { uiNotificationService } = servicesManager.services;
-
-      // Get labels for this model
-      const modelLabels = labelMaps?.modelLabelNames[selectedModel] || [];
-      const labels: SegmentationLabel[] = modelLabels.map((name, idx) => ({
-        id: labelMaps?.modelLabelToIdxMap[selectedModel]?.[name] || idx + 1,
-        name,
-      }));
-
-      // Convert ArrayBuffer to base64
-      const base64Data = btoa(
-        new Uint8Array(lastNrrdData).reduce((data, byte) => data + String.fromCharCode(byte), '')
-      );
-
-      await segmentationApiService.saveSegmentation({
-        seriesInstanceUid,
-        studyInstanceUid,
-        modelName: selectedModel,
-        labels,
-        maskData: base64Data,
-        maskFormat: 'NRRD',
-      });
-
-      console.log('MONAI Label: Segmentation saved');
-
-      if (uiNotificationService) {
-        uiNotificationService.show({
-          title: 'Segmentation Saved',
-          message: `Saved ${labels.length} segments`,
-          type: 'success',
-          duration: 3000,
-        });
-      }
-
-      // Refresh the list
-      await fetchSavedSegmentations();
-    } catch (err) {
-      console.error('MONAI Label: Failed to save segmentation', err);
-      setError(err instanceof Error ? err.message : 'Failed to save segmentation');
-    } finally {
-      setIsSaving(false);
-    }
-  };
-
   // Load a saved segmentation
   const handleLoadSegmentation = async (segmentation: SegmentationSummary) => {
     if (!segmentationApiService) return;
@@ -900,9 +951,6 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
       }
 
       await viewResponse(inferenceResponse, segmentation.modelName, labels, true);
-
-      // Store for potential re-save
-      setLastNrrdData(maskData);
       setSelectedModel(segmentation.modelName);
 
       setLastResult({
@@ -1067,27 +1115,24 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
         </button>
       </div>
 
-      {/* Last Result with Save Button */}
-      {lastResult && (
+      {/* In-flight job status */}
+      {activeJob && activeJob.status === 'PENDING' && (
+        <div className="mt-4 rounded border border-blue-500 bg-blue-900/40 p-3 text-sm">
+          <p className="flex items-center gap-2 font-medium text-blue-300">
+            <div className="h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
+            Segmentation in progress...
+          </p>
+          <p className="mt-1 text-xs text-gray-400">
+            The mask will appear automatically when ready.
+          </p>
+        </div>
+      )}
+
+      {/* Last result — the mask is already persisted server-side */}
+      {lastResult && !activeJob && (
         <div className="mt-4 rounded border border-green-500 bg-green-900/50 p-3 text-sm">
           <p className="font-medium text-green-400">Segmentation Complete</p>
           <p className="mt-1 text-xs text-gray-300">Segments: {lastResult.segments}</p>
-          {persistenceEnabled && lastNrrdData && (
-            <button
-              onClick={handleSaveSegmentation}
-              disabled={isSaving}
-              className="mt-2 w-full rounded bg-green-600 py-2 text-sm font-medium transition-colors hover:bg-green-700 disabled:cursor-not-allowed disabled:bg-gray-600"
-            >
-              {isSaving ? (
-                <span className="flex items-center justify-center gap-2">
-                  <div className="h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                  Saving...
-                </span>
-              ) : (
-                'Save Segmentation'
-              )}
-            </button>
-          )}
         </div>
       )}
 
