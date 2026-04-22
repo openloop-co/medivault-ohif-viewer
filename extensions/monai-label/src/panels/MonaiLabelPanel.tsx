@@ -133,6 +133,14 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
     labelMapsRef.current = labelMaps;
   }, [labelMaps]);
 
+  // Forward-declared ref to the paint-on-complete handler — the actual
+  // useCallback is defined later in the file (after viewResponse), so we
+  // use a ref to break the temporal-dead-zone cycle between the WebSocket
+  // useEffect (which needs to call it) and its dependency on viewResponse.
+  const paintSegmentationRef = useRef<
+    ((segmentation: SegmentationSummary) => Promise<void>) | null
+  >(null);
+
   // Get MONAI Label service from services manager
   const monaiService = servicesManager.services.monaiLabelService as MonaiLabelService | undefined;
   const segmentationApiService = servicesManager.services.segmentationApiService as
@@ -347,7 +355,7 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
 
       try {
         const seg = await segmentationApiService.getSegmentation(segmentationId);
-        await paintSegmentationFromApi(seg);
+        await paintSegmentationRef.current?.(seg);
         setActiveJob({ segmentationId, status: 'ACTIVE' });
         if (uiNotificationService) {
           uiNotificationService.show({
@@ -421,7 +429,7 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
       window.clearInterval(pollInterval);
       window.clearTimeout(pollTimeout);
     };
-  }, [activeJob, segmentationApiService, paintSegmentationFromApi, servicesManager, fetchSavedSegmentations]);
+  }, [activeJob, segmentationApiService, servicesManager, fetchSavedSegmentations]);
 
   // Fetch saved segmentations when viewport is ready or series changes
   useEffect(() => {
@@ -790,6 +798,12 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [segmentationApiService]
   );
+
+  // Keep the ref in sync — the WebSocket useEffect above calls through
+  // this ref to avoid a forward reference to paintSegmentationFromApi.
+  useEffect(() => {
+    paintSegmentationRef.current = paintSegmentationFromApi;
+  }, [paintSegmentationFromApi]);
 
   // Enqueue an async segmentation job. The worker Lambda runs MONAI,
   // uploads the mask to S3, and emits a SEGMENTATION_READY WebSocket
