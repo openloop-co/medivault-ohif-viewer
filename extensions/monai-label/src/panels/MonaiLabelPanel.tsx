@@ -125,6 +125,14 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
     { segmentationId: string; status: 'PENDING' | 'ACTIVE' | 'FAILED' } | null
   >(null);
 
+  // Keep the latest labelMaps readable from async callbacks without
+  // putting it in their dependency arrays (which would churn subscriptions
+  // every time labelMaps changes).
+  const labelMapsRef = useRef<ModelLabelMaps | null>(labelMaps);
+  useEffect(() => {
+    labelMapsRef.current = labelMaps;
+  }, [labelMaps]);
+
   // Get MONAI Label service from services manager
   const monaiService = servicesManager.services.monaiLabelService as MonaiLabelService | undefined;
   const segmentationApiService = servicesManager.services.segmentationApiService as
@@ -507,7 +515,7 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
         segmentIndex = s.segmentIndex;
       }
 
-      let modelSegIdx = labelMaps?.modelLabelToIdxMap[modelId]?.[label];
+      let modelSegIdx = labelMapsRef.current?.modelLabelToIdxMap[modelId]?.[label];
       modelSegIdx = modelSegIdx ? modelSegIdx : tmpModelSegIdx;
       modelToSegMapping[modelSegIdx] = 0xff & segmentIndex;
       tmpModelSegIdx++;
@@ -729,8 +737,9 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
     throw new Error('Failed to create labelmap for segmentation');
   };
 
-  // Paint a fetched segmentation (from presigned URL) onto the viewport
-  // using the same viewResponse path that load-from-saved already uses.
+  // Paint a fetched segmentation (from presigned URL) onto the viewport.
+  // Reads labelMaps via ref so repeated calls always see the current
+  // value even if labelMaps changed between enqueue and completion.
   const paintSegmentationFromApi = useCallback(
     async (segmentation: SegmentationSummary) => {
       if (!segmentationApiService) return;
@@ -751,9 +760,10 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
       };
 
       const labels = segmentation.labels.map((l) => l.name);
+      const currentMaps = labelMapsRef.current;
 
-      if (!labelMaps?.modelLabelToIdxMap[segmentation.modelName]) {
-        const newLabelMaps = { ...labelMaps } as ModelLabelMaps;
+      if (!currentMaps?.modelLabelToIdxMap[segmentation.modelName]) {
+        const newLabelMaps = { ...currentMaps } as ModelLabelMaps;
         newLabelMaps.modelLabelToIdxMap[segmentation.modelName] = {};
         newLabelMaps.modelIdxToLabelMap[segmentation.modelName] = {};
         newLabelMaps.modelLabelNames[segmentation.modelName] = [];
@@ -767,6 +777,7 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
         });
 
         setLabelMaps(newLabelMaps);
+        labelMapsRef.current = newLabelMaps;
       }
 
       await viewResponse(inferenceResponse, segmentation.modelName, labels, true);
@@ -775,9 +786,9 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
         segments: labels.length,
       });
     },
-    // viewResponse has stable references captured via servicesManager
+    // viewResponse is a stable lexical closure; labelMaps is read via ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [segmentationApiService, labelMaps]
+    [segmentationApiService]
   );
 
   // Enqueue an async segmentation job. The worker Lambda runs MONAI,
