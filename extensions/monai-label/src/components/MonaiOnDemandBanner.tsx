@@ -1,42 +1,60 @@
 /**
- * MONAI On-Demand Banner Component
+ * MONAI On-Demand Banner
  *
- * Displays the current MONAI service status when in on-demand mode.
- * Shows a banner with status indicator and estimated wait time when starting.
+ * Compact status panel styled to match native OHIF panels (shadcn tokens:
+ * muted/foreground/primary/destructive). Inline SVG icons keep the extension
+ * self-contained — importing `@ohif/ui-next` would pull in ThemeWrapper +
+ * mini-css-extract-plugin which the extension webpack config doesn't wire.
  */
 
 import React, { useEffect, useState } from 'react';
 import { MonaiOnDemandStatus } from '../services/MonaiOnDemandService';
 
 export interface MonaiOnDemandBannerProps {
-  /** Current status */
   status: MonaiOnDemandStatus;
-  /** Status message */
   message?: string;
-  /** Estimated wait time in seconds */
   estimatedWaitSeconds?: number;
-  /** Whether we're actively waiting for MONAI to start */
   isWaiting: boolean;
-  /** Callback to start MONAI */
   onStartClick?: () => void;
-  /** Whether a check/start is in progress */
   isLoading?: boolean;
 }
 
-/**
- * Format seconds into human-readable time
- */
 function formatWaitTime(seconds: number): string {
-  if (seconds < 60) {
-    return `~${seconds} secondi`;
-  }
+  if (seconds < 60) return `~${seconds} secondi`;
   const minutes = Math.ceil(seconds / 60);
   return `~${minutes} minut${minutes === 1 ? 'o' : 'i'}`;
 }
 
-/**
- * Banner showing MONAI on-demand status
- */
+// Inline SVG icons — outline 20×20, color via currentColor so parent's
+// text-* utility controls the tint.
+
+const PowerOffIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+    <line x1="12" y1="2" x2="12" y2="12" />
+  </svg>
+);
+
+const SpinnerIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+  </svg>
+);
+
+const WarningIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+    <line x1="12" y1="9" x2="12" y2="13" />
+    <line x1="12" y1="17" x2="12.01" y2="17" />
+  </svg>
+);
+
+const PlayIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} viewBox="0 0 24 24" fill="currentColor">
+    <path d="M8 5v14l11-7z" />
+  </svg>
+);
+
 export const MonaiOnDemandBanner: React.FC<MonaiOnDemandBannerProps> = ({
   status,
   message,
@@ -45,7 +63,6 @@ export const MonaiOnDemandBanner: React.FC<MonaiOnDemandBannerProps> = ({
   onStartClick,
   isLoading,
 }) => {
-  // Countdown timer for estimated wait
   const [countdown, setCountdown] = useState(estimatedWaitSeconds || 0);
 
   useEffect(() => {
@@ -54,78 +71,54 @@ export const MonaiOnDemandBanner: React.FC<MonaiOnDemandBannerProps> = ({
 
   useEffect(() => {
     if (!isWaiting || countdown <= 0) return;
-
     const timer = setInterval(() => {
       setCountdown(prev => Math.max(0, prev - 1));
     }, 1000);
-
     return () => clearInterval(timer);
   }, [isWaiting, countdown]);
 
-  // Don't show banner if running
   if (status === 'running') {
     return null;
   }
 
-  // Status-specific styles
-  const statusStyles = {
-    stopped: {
-      bg: 'bg-yellow-900/50',
-      border: 'border-yellow-500',
-      icon: '⏸️',
-      iconBg: 'bg-yellow-500',
-    },
-    starting: {
-      bg: 'bg-blue-900/50',
-      border: 'border-blue-500',
-      icon: '🚀',
-      iconBg: 'bg-blue-500',
-    },
-    error: {
-      bg: 'bg-red-900/50',
-      border: 'border-red-500',
-      icon: '❌',
-      iconBg: 'bg-red-500',
-    },
-  };
+  const isStopped = status === 'stopped';
+  const isStarting = status === 'starting';
+  const isError = status === 'error';
 
-  const style = statusStyles[status] || statusStyles.error;
+  const title =
+    isStopped ? 'MONAI Label non attivo' :
+    isStarting ? 'Avvio MONAI Label in corso' :
+    'Errore MONAI Label';
+
+  const icon =
+    isStopped ? <PowerOffIcon className="text-muted-foreground h-5 w-5" /> :
+    isStarting ? <SpinnerIcon className="text-primary h-5 w-5 animate-spin" /> :
+    <WarningIcon className="text-destructive h-5 w-5" />;
 
   return (
-    <div className={`mb-4 rounded border ${style.border} ${style.bg} p-4`}>
+    <div className="bg-muted/40 border-input mb-3 rounded border p-3">
       <div className="flex items-start gap-3">
-        {/* Status icon with animation for starting */}
-        <div className={`flex h-8 w-8 items-center justify-center rounded-full ${style.iconBg}`}>
-          {status === 'starting' && isWaiting ? (
-            <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-          ) : (
-            <span className="text-sm">{style.icon}</span>
-          )}
-        </div>
+        <div className="shrink-0 pt-0.5">{icon}</div>
 
-        <div className="flex-1">
-          {/* Title based on status */}
-          <h3 className="font-medium text-white">
-            {status === 'stopped' && 'MONAI Label non attivo'}
-            {status === 'starting' && 'Avvio MONAI Label in corso...'}
-            {status === 'error' && 'Errore MONAI Label'}
+        <div className="min-w-0 flex-1">
+          <h3 className="text-foreground text-base font-medium leading-tight">
+            {title}
           </h3>
 
-          {/* Message */}
           {message && (
-            <p className="mt-1 text-sm text-gray-300">{message}</p>
+            <p className="text-muted-foreground mt-1 text-sm leading-snug">
+              {message}
+            </p>
           )}
 
-          {/* Estimated wait time with countdown */}
-          {status === 'starting' && isWaiting && countdown > 0 && (
+          {isStarting && isWaiting && countdown > 0 && (
             <div className="mt-2">
-              <p className="text-sm text-gray-400">
+              <p className="text-muted-foreground text-xs">
                 Tempo stimato: {formatWaitTime(countdown)}
               </p>
-              {/* Progress bar */}
-              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-gray-700">
+              <div className="bg-input mt-1.5 h-1 w-full overflow-hidden rounded">
                 <div
-                  className="h-full animate-pulse rounded-full bg-blue-500"
+                  className="bg-primary h-full rounded transition-all duration-1000"
                   style={{
                     width: estimatedWaitSeconds
                       ? `${Math.max(0, 100 - (countdown / estimatedWaitSeconds) * 100)}%`
@@ -136,29 +129,40 @@ export const MonaiOnDemandBanner: React.FC<MonaiOnDemandBannerProps> = ({
             </div>
           )}
 
-          {/* Start button for stopped state */}
-          {status === 'stopped' && onStartClick && (
+          {isStarting && isWaiting && (
+            <p className="text-muted-foreground mt-2 text-xs leading-snug">
+              MONAI Label sta avviando un&apos;istanza GPU. Puoi continuare a navigare le immagini.
+            </p>
+          )}
+
+          {isStopped && onStartClick && (
             <button
               onClick={onStartClick}
               disabled={isLoading}
-              className="mt-3 rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-gray-600"
+              className="bg-primary/60 hover:bg-primary text-primary-foreground mt-3 inline-flex items-center gap-1.5 rounded px-3 py-1.5 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
             >
               {isLoading ? (
-                <span className="flex items-center gap-2">
-                  <div className="h-3 w-3 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                <>
+                  <SpinnerIcon className="h-3 w-3 animate-spin" />
                   Avvio...
-                </span>
+                </>
               ) : (
-                'Avvia MONAI Label'
+                <>
+                  <PlayIcon className="h-3 w-3" />
+                  Avvia MONAI Label
+                </>
               )}
             </button>
           )}
 
-          {/* Tip for starting state */}
-          {status === 'starting' && isWaiting && (
-            <p className="mt-3 text-xs text-gray-500">
-              MONAI Label sta avviando un'istanza GPU. Puoi continuare a navigare le immagini.
-            </p>
+          {isError && onStartClick && (
+            <button
+              onClick={onStartClick}
+              disabled={isLoading}
+              className="border-input hover:bg-muted text-foreground mt-3 inline-flex items-center rounded border bg-transparent px-3 py-1.5 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Riprova
+            </button>
           )}
         </div>
       </div>
