@@ -1027,26 +1027,33 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
 
   // Render status indicator
   const renderStatusIndicator = () => {
-    const statusColors = {
-      checking: 'bg-yellow-500',
-      online: 'bg-green-500',
-      offline: 'bg-red-500',
-    };
+    // In on-demand mode the offline state is fully described by the banner
+    // below (with an explicit "Avvia" CTA). Showing a second "Server offline"
+    // dot here is redundant noise.
+    if (onDemandEnabled && serverStatus !== 'online') {
+      return null;
+    }
+
+    const dotClass =
+      serverStatus === 'online' ? 'bg-green-500' :
+      serverStatus === 'checking' ? 'bg-muted-foreground/60' :
+      'bg-destructive';
+
+    const label =
+      serverStatus === 'checking' ? 'Connessione al server in corso...' :
+      serverStatus === 'online' ? 'Server online' :
+      'Server offline';
 
     return (
-      <div className="mb-4 flex items-center gap-2">
-        <div className={`h-3 w-3 rounded-full ${statusColors[serverStatus]}`} />
-        <span className="text-sm text-gray-300">
-          {serverStatus === 'checking' && 'Checking server...'}
-          {serverStatus === 'online' && 'Server online'}
-          {serverStatus === 'offline' && 'Server offline'}
-        </span>
+      <div className="mb-3 flex items-center gap-2">
+        <div className={`h-2 w-2 rounded-full ${dotClass}`} />
+        <span className="text-muted-foreground text-sm">{label}</span>
         <button
           onClick={fetchServerInfo}
-          className="ml-auto text-xs text-blue-400 hover:text-blue-300"
+          className="text-primary hover:text-primary/80 ml-auto text-xs disabled:opacity-50"
           disabled={isLoading}
         >
-          Refresh
+          Aggiorna
         </button>
       </div>
     );
@@ -1282,21 +1289,26 @@ const MonaiLabelPanel: React.FC<MonaiLabelPanelProps> = ({ servicesManager, comm
           {/* Segmentation Content - Active Learning and Options tabs hidden for now */}
           {renderSegmentationTab()}
         </>
-      ) : (
-        <div className="py-8 text-center">
-          <p className="mb-2 text-gray-400">Cannot connect to MONAI Label server</p>
-          <p className="mb-4 text-xs text-gray-500">
-            Check that the server is running at the URL above
+      ) : !onDemandEnabled ? (
+        // Fallback only for always-on deployments: when the server is
+        // genuinely unreachable. In on-demand mode the banner above already
+        // explains stopped/starting/error states, so don't duplicate.
+        <div className="border-input bg-muted/40 rounded border p-4 text-center">
+          <p className="text-foreground text-base font-medium">
+            Server MONAI Label irraggiungibile
+          </p>
+          <p className="text-muted-foreground mt-1 text-sm">
+            Verifica che il server sia attivo al recapito mostrato sopra.
           </p>
           <button
             onClick={fetchServerInfo}
-            className="rounded bg-blue-600 px-4 py-2 text-sm hover:bg-blue-700"
             disabled={isLoading}
+            className="bg-primary/60 hover:bg-primary text-primary-foreground mt-3 inline-flex items-center justify-center rounded px-3 py-1.5 text-sm disabled:opacity-50"
           >
-            {isLoading ? 'Connecting...' : 'Retry Connection'}
+            {isLoading ? 'Connessione...' : 'Riprova connessione'}
           </button>
         </div>
-      )}
+      ) : null}
     </div>
   );
 };
